@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      BRACE_DB: /data/brace.sqlite3
+    volumes:
+      - brace_data:/data
+  dashboard:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./dashboard:/app
+      - dashboard_node_modules:/app/node_modules
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    environment:
+      DOCKER_API_URL: http://api:8000
+    depends_on:
+      - api
+volumes:
+  brace_data:
+  dashboard_node_modules:
