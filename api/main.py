@@ -2,10 +2,31 @@
 import asyncio, json, os, subprocess, sys, threading
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from . import engine as e
 e.init()
 app = FastAPI(title='BRACE — Engineering Evaluation API', version='2.1.0')
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r'https?://.*',
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
+    expose_headers=['*'],
+)
+
+@app.get('/')
+def root():
+    return {
+        'service': 'BRACE — Engineering Evaluation API',
+        'status': 'healthy',
+        'version': '2.1.0',
+        'health': '/api/health',
+        'docs': '/docs',
+        'frontend': 'https://brace-kappa.vercel.app/'
+    }
 processes = {}
 gate = threading.RLock()
 
@@ -96,7 +117,16 @@ async def events(rid: str):
             else:
                 yield ': keepalive\n\n'
             await asyncio.sleep(0.3)
-    return StreamingResponse(generate(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+    return StreamingResponse(
+        generate(),
+        media_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+            'Access-Control-Allow-Origin': '*',
+        }
+    )
 
 @app.post('/api/reset')
 def reset():

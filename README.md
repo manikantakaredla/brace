@@ -6,6 +6,15 @@ When an order API times out, the agent cannot assume the order failed. BRACE rec
 
 > This is a single-host evaluation prototype, **not a production payment or order system**. BRACE-mode dashboard tool calls execute through `BraceRuntime.execute()`. The deterministic baseline modes remain separately scripted, and worker checkpoint orchestration remains part of the demo adapter.
 
+## Live Deployments
+
+- **Frontend (Vercel):** [https://brace-kappa.vercel.app/](https://brace-kappa.vercel.app/)
+- **Backend API (Render):** [https://brace-api-y8ha.onrender.com](https://brace-api-y8ha.onrender.com)
+- **Interactive OpenAPI Documentation:** [https://brace-api-y8ha.onrender.com/docs](https://brace-api-y8ha.onrender.com/docs)
+- **API Health Check:** [https://brace-api-y8ha.onrender.com/api/health](https://brace-api-y8ha.onrender.com/api/health)
+
+The frontend is configured to communicate directly with the Render backend API, supporting real-time Server-Sent Events (SSE) streaming, paired fault simulation runs, checkpoint inspection, and mock order tracking.
+
 ## Requirements
 
 - Python 3.11+; Node.js 22 and npm for manual setup.

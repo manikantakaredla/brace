@@ -2,7 +2,10 @@ import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Activity, ArrowDownToLine, ArrowRight, Check, ChevronRight, CircleAlert, CircleDot, ClipboardList, Database, FileJson, Gauge, GitBranch, HardDrive, Play, RotateCcw, Shield, Square, Terminal, Workflow, X } from 'lucide-react';
 import './style.css';
-const API = '/api';
+
+const RAW_BACKEND = (import.meta.env.VITE_API_URL || 'https://brace-api-y8ha.onrender.com').trim().replace(/\/+$/, '');
+const API = RAW_BACKEND.endsWith('/api') ? RAW_BACKEND : `${RAW_BACKEND}/api`;
+
 const scenarios = [
     ['timeout', 'S1 · Lost response', 'Create order, then drop the acknowledgement.'],
     ['server', 'S2 · HTTP 500', 'Two transient failures during catalog lookup.'],
@@ -13,25 +16,127 @@ const scenarios = [
     ['normal', 'S7 · Control run', 'Baseline with no injected faults.'],
 ];
 const steps = ['search_catalog', 'check_stock', 'place_order', 'send_confirmation', 'finish'];
-async function api(url, body) { let r = await fetch(API + url, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }); if (!r.ok) { let s = await r.text(); throw Error(s.slice(0, 220)) } return r.json() }
+async function api(url, body) {
+    let r = await fetch(API + url, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) })
+    });
+    if (!r.ok) {
+        let s = await r.text();
+        throw Error(s.slice(0, 220));
+    }
+    return r.json();
+}
 const money = n => '$' + Number(n || 0).toFixed(2);
 const fmtTime = x => new Date(x * 1000).toLocaleTimeString(undefined, { hour12: false });
 const cls = (s = '') => ['completed', 'succeeded'].includes(s) ? 'good' : ['failed', 'interrupted'].includes(s) ? 'bad' : ['paused', 'running'].includes(s) ? 'warn' : 'neutral';
+
 function App() {
-    const [page, setPage] = useState('executions'), [scenario, setScenario] = useState('timeout'), [seed, setSeed] = useState(42), [limit, setLimit] = useState(.5), [ids, setIds] = useState({}), [runs, setRuns] = useState({}), [selectedRun, setSelectedRun] = useState('brace'), [selectedEvent, setSelectedEvent] = useState(null), [filter, setFilter] = useState('all'), [busy, setBusy] = useState(false), [message, setMessage] = useState('Ready. All side effects are local deterministic mocks.'), [health, setHealth] = useState(false), [benchmark, setBenchmark] = useState(null);
-    useEffect(() => { api('/health').then(() => setHealth(true)).catch(() => setHealth(false)); api('/benchmarks').then(setBenchmark).catch(() => { }) }, []);
-    useEffect(() => { let connections = Object.entries(ids).map(([mode, id]) => { let es = new EventSource(`${API}/runs/${id}/events`); es.onmessage = e => { try { setRuns(prev => ({ ...prev, [mode]: JSON.parse(e.data) })) } catch { } }; return es }); return () => connections.forEach(e => e.close()) }, [ids.naive, ids.brace]);
+    const [page, setPage] = useState('executions'), [scenario, setScenario] = useState('timeout'), [seed, setSeed] = useState(42), [limit, setLimit] = useState(.5), [ids, setIds] = useState({}), [runs, setRuns] = useState({}), [selectedRun, setSelectedRun] = useState('brace'), [selectedEvent, setSelectedEvent] = useState(null), [filter, setFilter] = useState('all'), [busy, setBusy] = useState(false), [message, setMessage] = useState('Ready. Connected to BRACE runtime API.'), [health, setHealth] = useState(false), [benchmark, setBenchmark] = useState(null);
+
+    useEffect(() => {
+        const checkHealth = () => api('/health').then(() => setHealth(true)).catch(() => setHealth(false));
+        checkHealth();
+        api('/benchmarks').then(setBenchmark).catch(() => { });
+        const interval = setInterval(checkHealth, 15000);
+        return () => clearInterval(interval);
+    }, []);
+
+    useEffect(() => {
+        let connections = Object.entries(ids).map(([mode, id]) => {
+            let es = new EventSource(`${API}/runs/${id}/events`);
+            es.onmessage = e => {
+                try {
+                    const data = JSON.parse(e.data);
+                    setRuns(prev => ({ ...prev, [mode]: data }));
+                    if (['completed', 'failed', 'safe_stop', 'budget_exhausted'].includes(data.status)) {
+                        es.close();
+                    }
+                } catch { }
+            };
+            es.onerror = () => {
+                api(`/runs/${id}`).then(finalData => {
+                    setRuns(prev => ({ ...prev, [mode]: finalData }));
+                }).catch(() => { });
+            };
+            return es;
+        });
+        return () => connections.forEach(e => e.close());
+    }, [ids.naive, ids.brace]);
+
     const safe = runs.brace, unsafe = runs.naive, active = runs[selectedRun];
-    async function run() { setBusy(true); setRuns({}); setIds({}); setSelectedEvent(null); try { let a = await api('/runs', { mode: 'naive', scenario, seed: Number(seed), limit: Number(limit) }); let b = await api('/runs', { mode: 'brace', scenario, seed: Number(seed), limit: Number(limit) }); setIds({ naive: a.id, brace: b.id }); await Promise.all([api(`/runs/${a.id}/start`, {}), api(`/runs/${b.id}/start`, {})]); setPage('executions'); setMessage(`Started paired runs • seed ${seed}`) } catch (e) { setMessage(e.message) } finally { setBusy(false) } }
-    async function reset() { setBusy(true); try { await api('/reset', {}); setRuns({}); setIds({}); setMessage('Database cleared; ready for a new experiment.') } catch (e) { setMessage(e.message) } finally { setBusy(false) } }
-    async function action(mode, which) { try { let o = await api(`/runs/${ids[mode]}/${which}`, {}); setMessage(which === 'kill' ? `Worker ${mode} terminated. Checkpoint persisted.` : `Restarted ${mode} worker from last committed step. PID ${o.pid}`) } catch (e) { setMessage(e.message) } }
-    function download() { if (!active) return; let blob = new Blob([JSON.stringify(active, null, 2)], { type: 'application/json' }); let url = URL.createObjectURL(blob); let a = document.createElement('a'); a.href = url; a.download = `brace-evidence-${active.id}.json`; a.click(); URL.revokeObjectURL(url) }
+
+    async function run() {
+        setBusy(true); setRuns({}); setIds({}); setSelectedEvent(null);
+        try {
+            let a = await api('/runs', { mode: 'naive', scenario, seed: Number(seed), limit: Number(limit) });
+            let b = await api('/runs', { mode: 'brace', scenario, seed: Number(seed), limit: Number(limit) });
+            setIds({ naive: a.id, brace: b.id });
+            await Promise.all([api(`/runs/${a.id}/start`, {}), api(`/runs/${b.id}/start`, {})]);
+            setPage('executions');
+            setMessage(`Started paired runs • seed ${seed}`);
+        } catch (e) {
+            setMessage(e.message);
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function reset() {
+        setBusy(true);
+        try {
+            await api('/reset', {});
+            setRuns({}); setIds({});
+            setMessage('Database cleared; ready for a new experiment.');
+        } catch (e) {
+            setMessage(e.message);
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function action(mode, which) {
+        try {
+            let o = await api(`/runs/${ids[mode]}/${which}`, {});
+            setMessage(which === 'kill' ? `Worker ${mode} terminated. Checkpoint persisted.` : `Restarted ${mode} worker from last committed step. PID ${o.pid}`);
+        } catch (e) {
+            setMessage(e.message);
+        }
+    }
+
+    function download() {
+        if (!active) return;
+        let blob = new Blob([JSON.stringify(active, null, 2)], { type: 'application/json' });
+        let url = URL.createObjectURL(blob);
+        let a = document.createElement('a');
+        a.href = url;
+        a.download = `brace-evidence-${active.id}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
     const eventList = (active?.events || []).filter(e => filter === 'all' || e.type.includes(filter));
+
     return <div className="shell">
         <aside className="sidebar">
             <div className="brand"><div className="brand-symbol"><GitBranch size={20} /></div><div><strong>BRACE</strong><small>EXECUTION RUNTIME</small></div><span className="brand-version">v2</span></div>
             <div className="nav-section">WORKSPACE</div>
             {[['executions', Activity, 'Executions'], ['inspect', GitBranch, 'Execution inspector'], ['orders', Database, 'Mock order ledger'], ['benchmarks', Gauge, 'Evaluation'], ['about', ClipboardList, 'Architecture & limits']].map(([id, Icon, label]) => <button key={id} className={'nav ' + (page === id ? 'current' : '')} onClick={() => setPage(id)}><Icon size={16} />{label}{page === id && <ChevronRight size={14} className="nav-chevron" />}</button>)}
+            <div className="sidebar-bottom">
+                <div className="side-meta">
+                    <span className={`dot ${health ? 'good-dot' : 'bad-dot'}`} />
+                    <span className={health ? 'health-good' : 'health-bad'}>
+                        {health ? 'API Connected' : 'Connecting to API...'}
+                    </span>
+                </div>
+                <p style={{ margin: '8px 0 0', fontSize: '10px', color: '#728192' }}>
+                    Endpoint:<br />
+                    <code style={{ fontSize: '10px', color: '#9bb8d7', wordBreak: 'break-all' }}>
+                        {API.replace('/api', '')}
+                    </code>
+                </p>
+            </div>
         </aside>
         <div className="body">
             <main className="main">
