@@ -29,20 +29,40 @@ const STEPS = [
 ];
 
 async function api(url, body) {
-    let r = await fetch(API + url, {
+    const fullUrl = `${API}${url.startsWith('/') ? url : '/' + url}`;
+    const res = await fetch(fullUrl, {
         method: body === undefined ? 'GET' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         ...(body === undefined ? {} : { body: JSON.stringify(body) })
     });
-    if (!r.ok) {
-        let s = await r.text();
-        throw Error(s.slice(0, 220));
+    if (!res.ok) {
+        let errText = '';
+        try {
+            const errJson = await res.json();
+            errText = errJson.detail || JSON.stringify(errJson);
+        } catch {
+            errText = await res.text();
+        }
+        throw new Error(errText ? errText.slice(0, 180) : `HTTP ${res.status}`);
     }
-    return r.json();
+    return res.json();
 }
 
-const money = n => '$' + Number(n || 0).toFixed(2);
-const fmtTime = x => new Date(x * 1000).toLocaleTimeString(undefined, { hour12: false });
+const money = n => {
+    const num = Number(n);
+    return '$' + (isNaN(num) ? '0.00' : num.toFixed(2));
+};
+
+const fmtTime = x => {
+    if (x === null || x === undefined || isNaN(Number(x))) return '—';
+    try {
+        const d = new Date(Number(x) * 1000);
+        return isNaN(d.getTime()) ? '—' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    } catch {
+        return '—';
+    }
+};
+
 const cls = (s = '') => ['completed', 'succeeded'].includes(s) ? 'good' : ['failed', 'interrupted'].includes(s) ? 'bad' : ['paused', 'running'].includes(s) ? 'warn' : '';
 
 function App() {
@@ -79,24 +99,35 @@ function App() {
     }, []);
 
     useEffect(() => {
-        let connections = Object.entries(ids).map(([mode, id]) => {
-            if (!id) return null;
-            let es = new EventSource(`${API}/runs/${id}/events`);
-            es.onmessage = e => {
-                try {
-                    const data = JSON.parse(e.data);
-                    setRuns(prev => ({ ...prev, [mode]: data }));
-                } catch { }
-            };
-            es.onerror = () => {
-                api(`/runs/${id}`).then(finalData => {
-                    setRuns(prev => ({ ...prev, [mode]: finalData }));
-                }).catch(() => { });
-            };
-            return es;
-        }).filter(Boolean);
-        return () => connections.forEach(e => e.close());
-    }, [JSON.stringify(ids)]);
+        let activeStreams = [];
+        Object.entries(ids).forEach(([mode, id]) => {
+            if (!id) return;
+            try {
+                let es = new EventSource(`${API}/runs/${id}/events`);
+                es.onmessage = e => {
+                    try {
+                        const data = JSON.parse(e.data);
+                        if (data && data.id) {
+                            setRuns(prev => ({ ...prev, [mode]: data }));
+                        }
+                    } catch { }
+                };
+                es.onerror = () => {
+                    api(`/runs/${id}`).then(finalData => {
+                        if (finalData && finalData.id) {
+                            setRuns(prev => ({ ...prev, [mode]: finalData }));
+                        }
+                    }).catch(() => { });
+                };
+                activeStreams.push(es);
+            } catch { }
+        });
+        return () => {
+            activeStreams.forEach(s => {
+                try { s.close(); } catch { }
+            });
+        };
+    }, [ids.naive, ids.brace]);
 
     const safe = runs.brace;
     const unsafe = runs.naive;
@@ -109,30 +140,33 @@ function App() {
         setIds({});
         setSelectedEvent(null);
 
+        const safeLimit = Math.max(0.01, Math.min(100, Number(limit) || 0.45));
+        const safeSeed = Math.max(0, parseInt(seed, 10) || 42);
+
         try {
             if (execMode === 'comparative') {
-                let a = await api('/runs', { mode: 'naive', scenario, seed: Number(seed), limit: Number(limit) });
-                let b = await api('/runs', { mode: 'brace', scenario, seed: Number(seed), limit: Number(limit) });
+                let a = await api('/runs', { mode: 'naive', scenario, seed: safeSeed, limit: safeLimit });
+                let b = await api('/runs', { mode: 'brace', scenario, seed: safeSeed, limit: safeLimit });
                 setIds({ naive: a.id, brace: b.id });
                 await Promise.all([api(`/runs/${a.id}/start`, {}), api(`/runs/${b.id}/start`, {})]);
                 setSelectedRun('brace');
-                setMessage(`Started comparative runs · seed ${seed}`);
+                setMessage(`Started comparative runs · seed ${safeSeed}`);
             } else if (execMode === 'unprotected') {
-                let r = await api('/runs', { mode: 'naive', scenario, seed: Number(seed), limit: Number(limit) });
+                let r = await api('/runs', { mode: 'naive', scenario, seed: safeSeed, limit: safeLimit });
                 setIds({ naive: r.id });
                 await api(`/runs/${r.id}/start`, {});
                 setSelectedRun('naive');
-                setMessage(`Started baseline run · seed ${seed}`);
+                setMessage(`Started baseline run · seed ${safeSeed}`);
             } else {
-                let r = await api('/runs', { mode: 'brace', scenario, seed: Number(seed), limit: Number(limit) });
+                let r = await api('/runs', { mode: 'brace', scenario, seed: safeSeed, limit: safeLimit });
                 setIds({ brace: r.id });
                 await api(`/runs/${r.id}/start`, {});
                 setSelectedRun('brace');
-                setMessage(`Started BRACE run · seed ${seed}`);
+                setMessage(`Started BRACE run · seed ${safeSeed}`);
             }
             setPage('executions');
         } catch (e) {
-            setMessage(e.message);
+            setMessage(e.message || 'Failed to start execution.');
         } finally {
             setBusy(false);
         }
@@ -146,18 +180,20 @@ function App() {
             setIds({});
             setMessage('Database reset.');
         } catch (e) {
-            setMessage(e.message);
+            setMessage(e.message || 'Reset failed.');
         } finally {
             setBusy(false);
         }
     }
 
     async function action(mode, which) {
+        const targetId = ids[mode];
+        if (!targetId) return;
         try {
-            let o = await api(`/runs/${ids[mode]}/${which}`, {});
-            setMessage(which === 'kill' ? `Worker ${mode} terminated.` : `Worker ${mode} resumed (PID ${o.pid}).`);
+            let o = await api(`/runs/${targetId}/${which}`, {});
+            setMessage(which === 'kill' ? `Worker ${mode} terminated.` : `Worker ${mode} resumed (PID ${o.pid || '—'}).`);
         } catch (e) {
-            setMessage(e.message);
+            setMessage(e.message || `Action ${which} failed.`);
         }
     }
 
@@ -172,7 +208,28 @@ function App() {
         URL.revokeObjectURL(url);
     }
 
-    const eventList = (active?.events || []).filter(e => filter === 'all' || e.type.includes(filter));
+    const rawEvents = Array.isArray(active?.events) ? active.events : [];
+    const eventList = rawEvents.filter(e => e && e.type && (filter === 'all' || e.type.includes(filter)));
+    const receiptsList = Array.isArray(active?.receipts) ? active.receipts : [];
+
+    const orderRows = [runs.naive, runs.brace].filter(Boolean).flatMap(r => {
+        const list = Array.isArray(r.order_records) ? r.order_records : [];
+        return list.map((o, idx) => ({
+            id: o.id,
+            idem_key: o.idem_key || '—',
+            item: o.item || '—',
+            created_at: o.created_at,
+            runMode: r.mode || 'unknown',
+            runId: r.id || '',
+            isDuplicate: r.mode !== 'brace' && idx > 0
+        }));
+    });
+
+    const benchResults = Array.isArray(benchmark?.results) ? benchmark.results : [];
+    const budgetLimitNum = active && active.lim ? active.lim : Number(limit) || 0.45;
+    const spentPct = active && active.spent && budgetLimitNum > 0
+        ? Math.max(0, Math.min(100, (active.spent / budgetLimitNum) * 100))
+        : 0;
 
     return <div className="shell">
         <aside className="sidebar">
@@ -301,7 +358,7 @@ function App() {
                             />
                             <div className="preset-strip">
                                 <span className="preset-tag">Presets:</span>
-                                {currentScenario.presets.map((val, idx) => (
+                                {(currentScenario?.presets || []).map((val, idx) => (
                                     <button
                                         key={idx}
                                         type="button"
@@ -335,7 +392,7 @@ function App() {
 
                     <div className="scenario-summary-caption">
                         <CircleAlert size={14} />
-                        <span>{currentScenario.desc}</span>
+                        <span>{currentScenario?.desc || ''}</span>
                         <span style={{ marginLeft: 'auto', color: '#7a8898' }}>{message}</span>
                     </div>
 
@@ -380,7 +437,7 @@ function App() {
                                 <span className="label">Spend / Budget</span>
                                 <strong>{active ? money(active.spent) : '—'}</strong>
                                 <span className="caption">
-                                    {active ? `${money(active.remaining)} available of ${money(active.lim)}` : 'Limit: ' + money(limit)}
+                                    {active ? `${money(active.remaining)} available of ${money(budgetLimitNum)}` : 'Limit: ' + money(limit)}
                                 </span>
                             </div>
                         </div>
@@ -430,17 +487,17 @@ function App() {
                                         <p>Policy evaluation trail from SQLite receipts table</p>
                                     </div>
                                     <span className="mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                                        {active?.receipts?.length || 0} records
+                                        {receiptsList.length} records
                                     </span>
                                 </div>
                                 <div className="receipt-table-wrap">
-                                    {(active?.receipts?.length) ? active.receipts.map(r => (
+                                    {receiptsList.length ? receiptsList.map(r => (
                                         <div className="receipt-row" key={r.id}>
                                             <div className="receipt-marker" />
                                             <div className="receipt-body">
-                                                <strong>{r.decision.replaceAll('_', ' ')}</strong>
-                                                <p>{r.reason}</p>
-                                                <small>{fmtTime(r.ts)} · step {r.step + 1}</small>
+                                                <strong>{String(r.decision || 'DECISION').replaceAll('_', ' ')}</strong>
+                                                <p>{r.reason || '—'}</p>
+                                                <small>{fmtTime(r.ts)} · step {(r.step || 0) + 1}</small>
                                             </div>
                                         </div>
                                     )) : (
@@ -462,12 +519,12 @@ function App() {
                                 <div className="budget-widget">
                                     <div className="budget-numbers">
                                         <strong>{active ? money(active.spent) : '$0.00'}</strong>
-                                        <span>spent / {money(active?.lim ?? limit)} limit</span>
+                                        <span>spent / {money(budgetLimitNum)} limit</span>
                                     </div>
                                     <div className="budget-bar">
                                         <div
                                             className="budget-bar-fill"
-                                            style={{ width: `${active ? Math.min(100, (active.spent / active.lim) * 100) : 0}%` }}
+                                            style={{ width: `${spentPct}%` }}
                                         />
                                     </div>
                                     <div className="budget-breakdown">
@@ -599,59 +656,27 @@ function App() {
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {[runs.naive, runs.brace].filter(Boolean).flatMap(r =>
-                                        r.order_records.map((o, idx) => {
-                                            const isDuplicate = r.mode !== 'brace' && idx > 0;
-                                            return (
-                                                <tr key={r.id + o.id}>
-                                                    <td>
-                                                        <strong className="mono" style={{ color: r.mode === 'brace' ? 'var(--brand)' : 'var(--danger)' }}>
-                                                            {r.mode.toUpperCase()}
-                                                        </strong>
-                                                        <span className="mono" style={{ color: 'var(--text-muted)', marginLeft: '6px' }}>{r.id.slice(0, 7)}</span>
-                                                    </td>
-                                                    <td className="mono">#{o.id}</td>
-                                                    <td className="mono">{o.idem_key}</td>
-                                                    <td>{o.item}</td>
-                                                    <td className="mono">{fmtTime(o.created_at)}</td>
-                                                    <td>
-                                                        {isDuplicate ? (
-                                                            <span className="tag tag-dup">duplicate</span>
-                                                        ) : (
-                                                            <span className="tag tag-ok">committed</span>
-                                                        )}
-                                                    </td>
-                                                </tr>
-                                            );
-                                        })
-                                    ).length ? (
-                                        [runs.naive, runs.brace].filter(Boolean).flatMap(r =>
-                                            r.order_records.map((o, idx) => {
-                                                const isDuplicate = r.mode !== 'brace' && idx > 0;
-                                                return (
-                                                    <tr key={r.id + o.id}>
-                                                        <td>
-                                                            <strong className="mono" style={{ color: r.mode === 'brace' ? 'var(--brand)' : 'var(--danger)' }}>
-                                                                {r.mode.toUpperCase()}
-                                                            </strong>
-                                                            <span className="mono" style={{ color: 'var(--text-muted)', marginLeft: '6px' }}>{r.id.slice(0, 7)}</span>
-                                                        </td>
-                                                        <td className="mono">#{o.id}</td>
-                                                        <td className="mono">{o.idem_key}</td>
-                                                        <td>{o.item}</td>
-                                                        <td className="mono">{fmtTime(o.created_at)}</td>
-                                                        <td>
-                                                            {isDuplicate ? (
-                                                                <span className="tag tag-dup">duplicate</span>
-                                                            ) : (
-                                                                <span className="tag tag-ok">committed</span>
-                                                            )}
-                                                        </td>
-                                                    </tr>
-                                                );
-                                            })
-                                        )
-                                    ) : (
+                                    {orderRows.length ? orderRows.map(o => (
+                                        <tr key={o.runId + '-' + o.id}>
+                                            <td>
+                                                <strong className="mono" style={{ color: o.runMode === 'brace' ? 'var(--brand)' : 'var(--danger)' }}>
+                                                    {o.runMode.toUpperCase()}
+                                                </strong>
+                                                <span className="mono" style={{ color: 'var(--text-muted)', marginLeft: '6px' }}>{o.runId.slice(0, 7)}</span>
+                                            </td>
+                                            <td className="mono">#{o.id}</td>
+                                            <td className="mono">{o.idem_key}</td>
+                                            <td>{o.item}</td>
+                                            <td className="mono">{fmtTime(o.created_at)}</td>
+                                            <td>
+                                                {o.isDuplicate ? (
+                                                    <span className="tag tag-dup">duplicate</span>
+                                                ) : (
+                                                    <span className="tag tag-ok">committed</span>
+                                                )}
+                                            </td>
+                                        </tr>
+                                    )) : (
                                         <tr>
                                             <td colSpan="6" style={{ textAlign: 'center', padding: '36px', color: 'var(--text-muted)' }}>
                                                 No records committed yet. Start an execution to populate the ledger.
@@ -675,10 +700,10 @@ function App() {
                                 <RotateCcw size={12} /> Reload
                             </button>
                         </div>
-                        {benchmark?.results?.length ? (
+                        {benchResults.length ? (
                             <>
                                 <div style={{ padding: '10px 16px', background: '#10141b', borderBottom: '1px solid var(--border)', fontSize: '11px', color: 'var(--text-muted)' }}>
-                                    Trials per scenario: {benchmark.trials} · Generated: {benchmark.generated_at}
+                                    Trials per scenario: {benchmark?.trials || 30} · Generated: {benchmark?.generated_at || '—'}
                                 </div>
                                 <div className="table-wrap">
                                     <table>
@@ -695,10 +720,10 @@ function App() {
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {benchmark.results.map((r, i) => (
+                                            {benchResults.map((r, i) => (
                                                 <tr key={i}>
                                                     <td className="mono" style={{ color: r.mode === 'brace' ? 'var(--brand)' : 'var(--text-secondary)' }}>
-                                                        {r.mode.toUpperCase()}
+                                                        {(r.mode || '').toUpperCase()}
                                                     </td>
                                                     <td>{r.scenario}</td>
                                                     <td className="mono">{r.trials}</td>
@@ -753,23 +778,27 @@ function App() {
 }
 
 function RunPanel({ run, label, title, mode, onSelect, onKill, onResume }) {
+    const isRunValid = run && typeof run === 'object' && run.id;
+    const currentStep = isRunValid && typeof run.step === 'number' ? run.step : -1;
+    const currentStatus = isRunValid ? (run.status || 'idle') : 'idle';
+
     return <section className="run-card">
         <div className="run-card-header">
             <div>
                 <span className="type-pill">{label}</span>
                 <h3>{title}</h3>
             </div>
-            <span className={'status-tag ' + cls(run?.status)}>{run?.status || 'idle'}</span>
+            <span className={'status-tag ' + cls(currentStatus)}>{currentStatus}</span>
         </div>
 
         <div className="run-id-bar">
-            RUN ID: <span>{run?.id || 'not started'}</span>
+            RUN ID: <span>{isRunValid ? run.id : 'not started'}</span>
         </div>
 
         <div className="pipeline-list">
             {STEPS.map((step, i) => {
-                const done = run && i < run.step;
-                const active = run && i === run.step && run.status === 'running';
+                const done = isRunValid && i < currentStep;
+                const active = isRunValid && i === currentStep && currentStatus === 'running';
                 return (
                     <div className={'pipeline-step ' + (done ? 'done' : active ? 'active' : '')} key={step.name}>
                         <span className="step-num">{done ? <Check size={11} /> : String(i + 1).padStart(2, '0')}</span>
@@ -784,17 +813,17 @@ function RunPanel({ run, label, title, mode, onSelect, onKill, onResume }) {
         <div className="run-kpi-strip">
             <div>
                 <span>Orders</span>
-                <b>{run?.orders ?? '—'}</b>
+                <b>{isRunValid ? (run.orders ?? '—') : '—'}</b>
             </div>
             <div>
                 <span>Duplicates</span>
                 <b style={{ color: (run?.duplicates || 0) > 0 ? 'var(--danger)' : 'inherit' }}>
-                    {run?.duplicates ?? '—'}
+                    {isRunValid ? (run.duplicates ?? '—') : '—'}
                 </b>
             </div>
             <div>
                 <span>Spent</span>
-                <b>{run ? money(run.spent) : '—'}</b>
+                <b>{isRunValid ? money(run.spent) : '—'}</b>
             </div>
         </div>
 
@@ -802,12 +831,12 @@ function RunPanel({ run, label, title, mode, onSelect, onKill, onResume }) {
             <button className="link-btn" onClick={onSelect}>
                 Inspect audit log <ArrowRight size={12} />
             </button>
-            {run?.status === 'running' && (
+            {currentStatus === 'running' && (
                 <button className="btn-secondary btn-sm" onClick={onKill}>
                     <Square size={12} /> Terminate PID
                 </button>
             )}
-            {run?.status === 'interrupted' && (
+            {currentStatus === 'interrupted' && (
                 <button className="btn-secondary btn-sm" onClick={onResume}>
                     <RotateCcw size={12} /> Resume from checkpoint
                 </button>
