@@ -98,34 +98,48 @@ function App() {
         return () => clearInterval(interval);
     }, []);
 
+    // Reliable polling — fetch run state every 1s until terminal, then one final fetch
     useEffect(() => {
-        let activeStreams = [];
-        Object.entries(ids).forEach(([mode, id]) => {
-            if (!id) return;
+        const TERMINAL = ['completed', 'succeeded', 'failed', 'interrupted'];
+        const settled = {}; // track which modes are done
+        let cancelled = false;
+
+        async function fetchRun(mode, id) {
             try {
-                let es = new EventSource(`${API}/runs/${id}/events`);
-                es.onmessage = e => {
-                    try {
-                        const data = JSON.parse(e.data);
-                        if (data && data.id) {
-                            setRuns(prev => ({ ...prev, [mode]: data }));
-                        }
-                    } catch { }
-                };
-                es.onerror = () => {
-                    api(`/runs/${id}`).then(finalData => {
-                        if (finalData && finalData.id) {
-                            setRuns(prev => ({ ...prev, [mode]: finalData }));
-                        }
-                    }).catch(() => { });
-                };
-                activeStreams.push(es);
+                const data = await api(`/runs/${id}`);
+                if (cancelled) return;
+                if (data && data.id) {
+                    setRuns(prev => ({ ...prev, [mode]: data }));
+                    if (TERMINAL.includes(data.status)) {
+                        settled[mode] = true;
+                    }
+                }
             } catch { }
+        }
+
+        // Initial fetch immediately
+        Object.entries(ids).forEach(([mode, id]) => {
+            if (id) fetchRun(mode, id);
         });
-        return () => {
-            activeStreams.forEach(s => {
-                try { s.close(); } catch { }
+
+        // Poll every 1s
+        const timer = setInterval(() => {
+            if (cancelled) return;
+            let allDone = true;
+            Object.entries(ids).forEach(([mode, id]) => {
+                if (!id) return;
+                if (settled[mode]) return;
+                allDone = false;
+                fetchRun(mode, id);
             });
+            if (allDone && Object.keys(ids).length > 0) {
+                clearInterval(timer);
+            }
+        }, 1000);
+
+        return () => {
+            cancelled = true;
+            clearInterval(timer);
         };
     }, [ids.naive, ids.brace]);
 
@@ -397,49 +411,144 @@ function App() {
                     </div>
 
                     {page === 'executions' && <>
+                        {/* === COMPARATIVE VERDICT BANNER === */}
+                        {execMode === 'comparative' && unsafe && safe && (unsafe.status === 'completed' || safe.status === 'completed') && (
+                            <div className="verdict-banner">
+                                <div className="verdict-title">
+                                    <CircleAlert size={16} />
+                                    Comparison Result
+                                </div>
+                                <div className="verdict-grid">
+                                    <div className="verdict-col verdict-bad">
+                                        <div className="verdict-col-label">BASELINE (Unprotected)</div>
+                                        <div className="verdict-stat">
+                                            <span className="verdict-num danger-text">{unsafe?.orders ?? '—'}</span>
+                                            <span>orders committed</span>
+                                        </div>
+                                        <div className="verdict-stat">
+                                            <span className="verdict-num danger-text">{unsafe?.duplicates ?? '—'}</span>
+                                            <span>duplicates</span>
+                                        </div>
+                                        <div className="verdict-stat">
+                                            <span className="verdict-num">{money(unsafe?.spent)}</span>
+                                            <span>spent</span>
+                                        </div>
+                                        <div className="verdict-stat">
+                                            <span className="verdict-num">{unsafe?.retries ?? '—'}</span>
+                                            <span>blind retries</span>
+                                        </div>
+                                        {(unsafe?.receipts || []).map(r => (
+                                            <div key={r.id} className="verdict-receipt bad">
+                                                {String(r.decision || '').replaceAll('_', ' ')}
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="verdict-divider">
+                                        <span>VS</span>
+                                    </div>
+                                    <div className="verdict-col verdict-good">
+                                        <div className="verdict-col-label">BRACE (Protected)</div>
+                                        <div className="verdict-stat">
+                                            <span className="verdict-num good-text">{safe?.orders ?? '—'}</span>
+                                            <span>orders committed</span>
+                                        </div>
+                                        <div className="verdict-stat">
+                                            <span className="verdict-num good-text">{safe?.duplicates ?? '0'}</span>
+                                            <span>duplicates</span>
+                                        </div>
+                                        <div className="verdict-stat">
+                                            <span className="verdict-num">{money(safe?.spent)}</span>
+                                            <span>spent</span>
+                                        </div>
+                                        <div className="verdict-stat">
+                                            <span className="verdict-num good-text">{safe?.verification_count ?? '—'}</span>
+                                            <span>verifications</span>
+                                        </div>
+                                        {(safe?.receipts || []).map(r => (
+                                            <div key={r.id} className="verdict-receipt good">
+                                                {String(r.decision || '').replaceAll('_', ' ')}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                                {(unsafe?.duplicates || 0) > (safe?.duplicates || 0) && (
+                                    <div className="verdict-summary">
+                                        BRACE prevented <strong>{(unsafe?.duplicates || 0) - (safe?.duplicates || 0)}</strong> duplicate side-effect(s)
+                                        {(safe?.verification_count || 0) > 0 && <> via <strong>{safe.verification_count}</strong> outcome verification(s)</>}.
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
                         {/* Metrics Grid */}
                         <div className="metrics-grid">
-                            <div className="metric-card panel">
-                                <span className="label">
-                                    {execMode === 'unprotected' ? 'Baseline status' : 'BRACE status'}
-                                </span>
-                                <strong className={cls((execMode === 'unprotected' ? unsafe : safe)?.status)}>
-                                    {(execMode === 'unprotected' ? unsafe : safe)?.status || 'idle'}
-                                </strong>
-                                <span className="caption">
-                                    {execMode === 'unprotected' ? 'Unprotected agent' : 'Protected runtime'}
-                                </span>
-                            </div>
-
-                            <div className="metric-card panel">
-                                <span className="label">Committed orders</span>
-                                <strong>
-                                    {execMode === 'comparative'
-                                        ? `${unsafe?.orders ?? '—'} vs ${safe?.orders ?? '—'}`
-                                        : (active?.orders ?? '—')}
-                                </strong>
-                                <span className="caption">Target: orders.sqlite3</span>
-                            </div>
-
-                            <div className="metric-card panel">
-                                <span className="label">Duplicate side effects</span>
-                                <strong style={{ color: (active?.duplicates || 0) > 0 ? 'var(--danger)' : 'inherit' }}>
-                                    {execMode === 'comparative'
-                                        ? `${unsafe?.duplicates ?? '—'} vs ${safe?.duplicates ?? '0'}`
-                                        : (active?.duplicates ?? '—')}
-                                </strong>
-                                <span className="caption">
-                                    {(active?.duplicates || 0) > 0 ? 'Unverified duplicate writes' : 'Zero duplicates'}
-                                </span>
-                            </div>
-
-                            <div className="metric-card panel">
-                                <span className="label">Spend / Budget</span>
-                                <strong>{active ? money(active.spent) : '—'}</strong>
-                                <span className="caption">
-                                    {active ? `${money(active.remaining)} available of ${money(budgetLimitNum)}` : 'Limit: ' + money(limit)}
-                                </span>
-                            </div>
+                            {execMode === 'comparative' ? (<>
+                                <div className="metric-card panel">
+                                    <span className="label">Baseline status</span>
+                                    <strong className={cls(unsafe?.status)}>{unsafe?.status || 'idle'}</strong>
+                                    <span className="caption">Unprotected agent</span>
+                                </div>
+                                <div className="metric-card panel">
+                                    <span className="label">BRACE status</span>
+                                    <strong className={cls(safe?.status)}>{safe?.status || 'idle'}</strong>
+                                    <span className="caption">Protected runtime</span>
+                                </div>
+                                <div className="metric-card panel">
+                                    <span className="label">Orders (baseline → BRACE)</span>
+                                    <strong>
+                                        <span style={{ color: (unsafe?.duplicates || 0) > 0 ? 'var(--danger)' : 'inherit' }}>{unsafe?.orders ?? '—'}</span>
+                                        <span style={{ margin: '0 6px', color: 'var(--text-muted)' }}>→</span>
+                                        <span style={{ color: 'var(--brand)' }}>{safe?.orders ?? '—'}</span>
+                                    </strong>
+                                    <span className="caption">
+                                        {(unsafe?.orders ?? 0) > (safe?.orders ?? 0) ? 'BRACE reduced duplicate orders' : 'orders.sqlite3'}
+                                    </span>
+                                </div>
+                                <div className="metric-card panel">
+                                    <span className="label">Duplicates (baseline → BRACE)</span>
+                                    <strong>
+                                        <span style={{ color: (unsafe?.duplicates || 0) > 0 ? 'var(--danger)' : 'inherit', fontWeight: 700 }}>{unsafe?.duplicates ?? '—'}</span>
+                                        <span style={{ margin: '0 6px', color: 'var(--text-muted)' }}>→</span>
+                                        <span style={{ color: 'var(--brand)', fontWeight: 700 }}>{safe?.duplicates ?? '0'}</span>
+                                    </strong>
+                                    <span className="caption">
+                                        {(unsafe?.duplicates || 0) > 0 ? 'Baseline produced unverified duplicates' : 'No duplicates either way'}
+                                    </span>
+                                </div>
+                            </>) : (<>
+                                <div className="metric-card panel">
+                                    <span className="label">
+                                        {execMode === 'unprotected' ? 'Baseline status' : 'BRACE status'}
+                                    </span>
+                                    <strong className={cls(active?.status)}>
+                                        {active?.status || 'idle'}
+                                    </strong>
+                                    <span className="caption">
+                                        {execMode === 'unprotected' ? 'Unprotected agent' : 'Protected runtime'}
+                                    </span>
+                                </div>
+                                <div className="metric-card panel">
+                                    <span className="label">Committed orders</span>
+                                    <strong>{active?.orders ?? '—'}</strong>
+                                    <span className="caption">Target: orders.sqlite3</span>
+                                </div>
+                                <div className="metric-card panel">
+                                    <span className="label">Duplicate side effects</span>
+                                    <strong style={{ color: (active?.duplicates || 0) > 0 ? 'var(--danger)' : 'inherit' }}>
+                                        {active?.duplicates ?? '—'}
+                                    </strong>
+                                    <span className="caption">
+                                        {(active?.duplicates || 0) > 0 ? 'Unverified duplicate writes' : 'Zero duplicates'}
+                                    </span>
+                                </div>
+                                <div className="metric-card panel">
+                                    <span className="label">Spend / Budget</span>
+                                    <strong>{active ? money(active.spent) : '—'}</strong>
+                                    <span className="caption">
+                                        {active ? `${money(active.remaining)} available of ${money(budgetLimitNum)}` : 'Limit: ' + money(limit)}
+                                    </span>
+                                </div>
+                            </>)}
                         </div>
 
                         {/* Execution View */}
@@ -478,62 +587,122 @@ function App() {
                             </div>
                         )}
 
-                        {/* Bottom Split: Decision Receipts + Budget */}
-                        <div className="bottom-split">
-                            <div className="panel">
-                                <div className="panel-header">
-                                    <div>
-                                        <h2>Recovery Receipts</h2>
-                                        <p>Policy evaluation trail from SQLite receipts table</p>
+                        {/* Bottom Split: Receipts comparison in comparative mode */}
+                        {execMode === 'comparative' ? (
+                            <div className="bottom-split">
+                                <div className="panel">
+                                    <div className="panel-header">
+                                        <div>
+                                            <h2>Baseline Receipts</h2>
+                                            <p>Unprotected agent decisions</p>
+                                        </div>
+                                        <span className="mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                                            {(unsafe?.receipts || []).length} records
+                                        </span>
                                     </div>
-                                    <span className="mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                                        {receiptsList.length} records
-                                    </span>
-                                </div>
-                                <div className="receipt-table-wrap">
-                                    {receiptsList.length ? receiptsList.map(r => (
-                                        <div className="receipt-row" key={r.id}>
-                                            <div className="receipt-marker" />
-                                            <div className="receipt-body">
-                                                <strong>{String(r.decision || 'DECISION').replaceAll('_', ' ')}</strong>
-                                                <p>{r.reason || '—'}</p>
-                                                <small>{fmtTime(r.ts)} · step {(r.step || 0) + 1}</small>
+                                    <div className="receipt-table-wrap">
+                                        {(unsafe?.receipts || []).length ? (unsafe.receipts).map(r => (
+                                            <div className="receipt-row receipt-bad" key={r.id}>
+                                                <div className="receipt-marker bad" />
+                                                <div className="receipt-body">
+                                                    <strong style={{ color: 'var(--danger)' }}>{String(r.decision || 'DECISION').replaceAll('_', ' ')}</strong>
+                                                    <p>{r.reason || '—'}</p>
+                                                    <small>{fmtTime(r.ts)} · step {(r.step || 0) + 1}</small>
+                                                </div>
                                             </div>
-                                        </div>
-                                    )) : (
-                                        <div style={{ padding: '36px 18px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '12px' }}>
-                                            No policy receipts recorded for this run.
-                                        </div>
-                                    )}
+                                        )) : (
+                                            <div style={{ padding: '36px 18px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '12px' }}>
+                                                No receipts for baseline run.
+                                            </div>
+                                        )}
+                                    </div>
                                 </div>
-                            </div>
 
-                            <div className="panel">
-                                <div className="panel-header">
-                                    <div>
-                                        <h2>Budget Ledger</h2>
-                                        <p>Real-time spend against authorized limit</p>
+                                <div className="panel">
+                                    <div className="panel-header">
+                                        <div>
+                                            <h2>BRACE Receipts</h2>
+                                            <p>Protected runtime decisions</p>
+                                        </div>
+                                        <span className="mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                                            {(safe?.receipts || []).length} records
+                                        </span>
                                     </div>
-                                    <span className="mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>USD</span>
-                                </div>
-                                <div className="budget-widget">
-                                    <div className="budget-numbers">
-                                        <strong>{active ? money(active.spent) : '$0.00'}</strong>
-                                        <span>spent / {money(budgetLimitNum)} limit</span>
-                                    </div>
-                                    <div className="budget-bar">
-                                        <div
-                                            className="budget-bar-fill"
-                                            style={{ width: `${spentPct}%` }}
-                                        />
-                                    </div>
-                                    <div className="budget-breakdown">
-                                        <span>Reserved: <b>{money(active?.reserved)}</b></span>
-                                        <span>Available: <b>{money(active?.remaining ?? limit)}</b></span>
+                                    <div className="receipt-table-wrap">
+                                        {(safe?.receipts || []).length ? (safe.receipts).map(r => (
+                                            <div className="receipt-row receipt-good" key={r.id}>
+                                                <div className="receipt-marker good" />
+                                                <div className="receipt-body">
+                                                    <strong style={{ color: 'var(--brand)' }}>{String(r.decision || 'DECISION').replaceAll('_', ' ')}</strong>
+                                                    <p>{r.reason || '—'}</p>
+                                                    <small>{fmtTime(r.ts)} · step {(r.step || 0) + 1}</small>
+                                                </div>
+                                            </div>
+                                        )) : (
+                                            <div style={{ padding: '36px 18px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '12px' }}>
+                                                No receipts for BRACE run.
+                                            </div>
+                                        )}
                                     </div>
                                 </div>
                             </div>
-                        </div>
+                        ) : (
+                            <div className="bottom-split">
+                                <div className="panel">
+                                    <div className="panel-header">
+                                        <div>
+                                            <h2>Recovery Receipts</h2>
+                                            <p>Policy evaluation trail from SQLite receipts table</p>
+                                        </div>
+                                        <span className="mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                                            {receiptsList.length} records
+                                        </span>
+                                    </div>
+                                    <div className="receipt-table-wrap">
+                                        {receiptsList.length ? receiptsList.map(r => (
+                                            <div className="receipt-row" key={r.id}>
+                                                <div className="receipt-marker" />
+                                                <div className="receipt-body">
+                                                    <strong>{String(r.decision || 'DECISION').replaceAll('_', ' ')}</strong>
+                                                    <p>{r.reason || '—'}</p>
+                                                    <small>{fmtTime(r.ts)} · step {(r.step || 0) + 1}</small>
+                                                </div>
+                                            </div>
+                                        )) : (
+                                            <div style={{ padding: '36px 18px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '12px' }}>
+                                                No policy receipts recorded for this run.
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="panel">
+                                    <div className="panel-header">
+                                        <div>
+                                            <h2>Budget Ledger</h2>
+                                            <p>Real-time spend against authorized limit</p>
+                                        </div>
+                                        <span className="mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>USD</span>
+                                    </div>
+                                    <div className="budget-widget">
+                                        <div className="budget-numbers">
+                                            <strong>{active ? money(active.spent) : '$0.00'}</strong>
+                                            <span>spent / {money(budgetLimitNum)} limit</span>
+                                        </div>
+                                        <div className="budget-bar">
+                                            <div
+                                                className="budget-bar-fill"
+                                                style={{ width: `${spentPct}%` }}
+                                            />
+                                        </div>
+                                        <div className="budget-breakdown">
+                                            <span>Reserved: <b>{money(active?.reserved)}</b></span>
+                                            <span>Available: <b>{money(active?.remaining ?? limit)}</b></span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
                     </>}
 
                     {page === 'inspect' && (
